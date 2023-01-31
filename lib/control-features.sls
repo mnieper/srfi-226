@@ -182,7 +182,7 @@
 	 (p mk tag c non-comp?)))))
 
   (define make-continuation
-    (lambda (mk k marks winders prompt-tag resume-k non-composable?)
+    (lambda (mk k marks parameterization winders prompt-tag resume-k non-composable?)
       (%case-lambda-box
 	  (make-continuation-info mk prompt-tag resume-k non-composable?)
 	[val* (resume-k (lambda () (apply values val*)))])))
@@ -228,7 +228,10 @@
 
   (define-record-type dynamic-environment
     (nongenerative) (sealed #t) (opaque #t)
-    (fields (mutable metacontinuation) (mutable marks) (mutable winders)
+    (fields (mutable metacontinuation)
+            (mutable marks)
+            (mutable parameterization)
+            (mutable winders)
 	    (mutable thread)))
 
   (define current-metacontinuation
@@ -245,6 +248,13 @@
      [(marks) (dynamic-environment-marks-set!
 	       (%current-dynamic-environment) marks)]))
 
+  (define current-parameterization
+    (case-lambda
+     [() (dynamic-environment-parameterization
+	  (%current-dynamic-environment))]
+     [(parameterization) (dynamic-environment-parameterization-set!
+	       (%current-dynamic-environment) parameterization)]))
+
   (define current-winders
     (case-lambda
      [() (dynamic-environment-winders
@@ -255,9 +265,8 @@
   ;; Marks
 
   (define make-marks
-    (lambda (parameterization handler-stack)
-      (list (cons (parameterization-continuation-mark-key) parameterization)
-	    (cons (handler-stack-continuation-mark-key) handler-stack))))
+    (lambda (handler-stack)
+      (list (cons (handler-stack-continuation-mark-key) handler-stack))))
 
   (define marks-ref
     (case-lambda
@@ -297,8 +306,7 @@
 
   (define clear-marks!
     (lambda ()
-      (current-marks (make-marks (current-parameterization)
-				 (exception-handler-stack)))))
+      (current-marks (make-marks (exception-handler-stack)))))
 
   (define set-mark!
     (lambda (key val)
@@ -320,15 +328,15 @@
 
   (define-record-type winder
     (nongenerative) (sealed #t) (opaque #f)
-    (fields height continuation marks pre-thunk post-thunk)
+    (fields height continuation marks parameterization pre-thunk post-thunk)
     (protocol
      (lambda (p)
-       (lambda (ht k marks pre-thunk post-thunk)
+       (lambda (ht k marks parameterization pre-thunk post-thunk)
 	 (assert (fixnum? ht))
 	 (assert (procedure? k))
 	 (assert (procedure? pre-thunk))
 	 (assert (procedure? post-thunk))
-	 (p ht k marks pre-thunk post-thunk)))))
+	 (p ht k marks parameterization pre-thunk post-thunk)))))
 
   (define winders-height
     (lambda (winders)
@@ -358,15 +366,15 @@
 
   (define-record-type metacontinuation-frame
     (nongenerative) (sealed #t) (opaque #f)
-    (fields tag continuation handler marks winders) ;TODO: Move handler before contination.
+    (fields tag continuation handler marks parameterization winders) ;TODO: Move handler before contination.
     (protocol
      (lambda (p)
-       (lambda (tag k handler marks winders)
+       (lambda (tag k handler marks parameterization winders)
 	 (assert (or (not tag)
 		     (continuation-prompt-tag? tag)))
 	 (assert (procedure? k))
 	 (assert (or (not handler) (procedure? handler)))
-	 (p tag k handler marks winders)))))
+	 (p tag k handler marks parameterization winders)))))
 
   (define push-metacontinuation-frame!
     (lambda (frame)
@@ -381,6 +389,7 @@
 	     (let ([mf (car mk)])
 	       (current-metacontinuation (cdr mk))
 	       (current-marks (metacontinuation-frame-marks mf))
+               (current-parameterization (metacontinuation-frame-parameterization mf))
 	       (current-winders (metacontinuation-frame-winders mf))
 	       mf)))))
 
@@ -456,7 +465,8 @@
 	(default-continuation-prompt-tag)
 	k
 	(make-default-handler (default-continuation-prompt-tag))
-	(make-marks parameterization handler-stack)
+	(make-marks handler-stack)
+        parameterization
 	#f))))
 
   (define make-initial-dynamic-environment
@@ -465,12 +475,13 @@
 	(make-dynamic-environment
 	 (make-initial-metacontinuation k parameterization
 					handler-stack)
-	 (make-marks parameterization (list
-				       (lambda (exc)
-					 (unless (non-serious-condition? exc)
-					   (abort-current-continuation (default-continuation-prompt-tag)
-					     (lambda ()
-					       (raise exc)))))))
+	 (make-marks  (list
+		       (lambda (exc)
+			 (unless (non-serious-condition? exc)
+			   (abort-current-continuation (default-continuation-prompt-tag)
+			     (lambda ()
+			       (raise exc)))))))
+         parameterization
 	 '()
 	 thread))))
 
@@ -565,7 +576,7 @@
        (lambda (k)
 	 (when (not (empty-continuation? k))
 	   (push-metacontinuation-frame!
-	    (make-metacontinuation-frame #f k #f (current-marks) (current-winders)))
+	    (make-metacontinuation-frame #f k #f (current-marks) (current-parameterization) (current-winders)))
 	   (clear-marks!)
 	   (current-winders '()))
 	 (abort thunk)))))
@@ -581,18 +592,19 @@
 		   (not (empty-continuation? k))
 		   (not (empty-marks?)))
 	   (push-metacontinuation-frame!
-	    (make-metacontinuation-frame tag k handler (current-marks) (current-winders)))
+	    (make-metacontinuation-frame tag k handler (current-marks) (current-parameterization) (current-winders)))
 	   (clear-marks!)
 	   (current-winders '()))
 	 (abort thunk)))]))
 
   (define abort-to
-    (lambda (k marks winders thunk)
+    (lambda (k marks parameterization winders thunk)
       (assert (procedure? k))
       (%call-in-continuation
        k
        (lambda ()
 	 (current-marks marks)
+         (current-parameterization parameterization)
 	 (current-winders winders)
 	 (thunk)))))
 
@@ -634,6 +646,7 @@
 		    (abort-to
 		     (metacontinuation-frame-continuation mf)
 		     (metacontinuation-frame-marks mf)
+                     (metacontinuation-frame-parameterization mf)
 		     (metacontinuation-frame-winders mf)
 		     (lambda ()
 		       (apply handler arg*))))
@@ -642,6 +655,7 @@
 		    (f))))
 	    (wind-to
 	     (current-marks)
+             (current-parameterization)
 	     '()
 	     f
 	     (lambda ()
@@ -658,45 +672,48 @@
   ;; Continuations
 
   (define make-composable-continuation
-    (lambda (mk k marks winders prompt-tag)
+    (lambda (mk k marks parameterization winders prompt-tag)
       (make-continuation
        mk
        k
        marks
+       parameterization
        winders
        prompt-tag
        (lambda (thunk)
-	 (call-in-composable-continuation mk k marks winders thunk))
+	 (call-in-composable-continuation mk k marks parameterization winders thunk))
        #f)))
 
   (define make-non-composable-continuation
-    (lambda (mk k marks winders prompt-tag)
+    (lambda (mk k marks parameterization winders prompt-tag)
       (make-continuation
        mk
        k
        marks
+       parameterization
        winders
        prompt-tag
        (lambda (thunk)
-	 (call-in-non-composable-continuation mk k marks winders prompt-tag thunk))
+	 (call-in-non-composable-continuation mk k marks parameterization winders prompt-tag thunk))
        #t)))
 
   (define call-in-composable-continuation
-    (lambda (mk k marks winders thunk)
+    (lambda (mk k marks parameterization winders thunk)
       (call-in-empty-marks
        (lambda ()
-	 (abort-to-composition (reverse mk) k marks winders thunk #f)))))
+	 (abort-to-composition (reverse mk) k marks parameterization winders thunk #f)))))
 
   (define call-in-non-composable-continuation
-    (lambda (mk k marks winders prompt-tag thunk)
+    (lambda (mk k marks parameterization winders prompt-tag thunk)
       (let retry ()
 	(let-values ([(dest-mf* base-mk)
 		      (common-metacontinuation #f mk (current-metacontinuation) prompt-tag)])
 	  (let f ()
 	    (if (eq? (current-metacontinuation) base-mk)
-		(abort-to-composition dest-mf* k marks winders thunk retry)
+		(abort-to-composition dest-mf* k marks parameterization winders thunk retry)
 		(wind-to
 		 (current-marks)
+                 (current-parameterization)
 		 '()
 		 (lambda ()
 		   (pop-metacontinuation-frame!)
@@ -704,18 +721,20 @@
 		 retry)))))))
 
   (define abort-to-composition
-    (lambda (mf* k marks winders thunk maybe-again-thunk)
+    (lambda (mf* k marks parameterization winders thunk maybe-again-thunk)
       (let f ([mf* mf*])
 	(if (null? mf*)
 	    (wind-to
 	     marks
+             parameterization
 	     winders
 	     (lambda ()
-	       (abort-to k marks winders thunk))
+	       (abort-to k marks parameterization winders thunk))
 	     maybe-again-thunk)
 	    (let ([mf (car mf*)])
 	      (wind-to
 	       (metacontinuation-frame-marks mf)
+               (metacontinuation-frame-parameterization mf)
 	       (metacontinuation-frame-winders mf)
 	       (lambda ()
 		 (current-metacontinuation (cons mf (current-metacontinuation)))
@@ -736,6 +755,7 @@
 		(take-metacontinuation who prompt-tag #f)
 		k
 		(current-marks)
+                (current-parameterization)
 		(current-winders)
 		prompt-tag))))]))
 
@@ -757,6 +777,7 @@
 	   (take-metacontinuation who prompt-tag #t)
 	   k
 	   (current-marks)
+           (current-parameterization)
 	   (current-winders)
 	   prompt-tag))))]))
 
@@ -847,6 +868,7 @@
 		[winder (make-winder (winders-height winders)
 				     k
 				     (current-marks)
+                                     (current-parameterization)
 				     pre-thunk post-thunk)])
 	   (pre-thunk)
 	   (current-winders (cons winder winders))
@@ -857,9 +879,10 @@
 	       (apply values val*))))))))
 
   (define wind-to
-    (lambda (marks dest-winders then-thunk maybe-again-thunk)
+    (lambda (marks parameterization dest-winders then-thunk maybe-again-thunk)
       (let ([saved-mk (current-metacontinuation)])
 	(current-marks marks)
+        (current-parameterization parameterization)
 	(let f ([winder* '()] [dest-winders dest-winders])
 	  (if (and maybe-again-thunk (not (eq? saved-mk (current-metacontinuation))))
 	      (maybe-again-thunk)
@@ -892,6 +915,7 @@
 	  (abort-to
 	   (winder-continuation winder)
 	   (winder-marks winder)
+           (winder-parameterization winder)
 	   winders
 	   (lambda ()
 	     (winder-thunk)
@@ -1132,6 +1156,7 @@
       (lambda ()
 	mark-key)))
 
+  #;
   (define current-parameterization
     (lambda ()
       (marks-ref (current-marks) (parameterization-continuation-mark-key))))
@@ -1142,9 +1167,10 @@
 	(assertion-violation who "not a paramerization" parameterization))
       (unless (procedure? thunk)
 	(assertion-violation who "not a procedure" thunk))
-      (with-continuation-mark (parameterization-continuation-mark-key)
-	  parameterization
-	(thunk))))
+      (call-in-empty-continuation
+       (lambda ()
+         (current-parameterization parameterization)
+         (thunk)))))
 
   (define-record-type parameter-info
     (nongenerative) (sealed #t) (opaque #t)
@@ -1214,13 +1240,13 @@
     (lambda (stx)
       (syntax-case stx ()
 	[(_ ([p v] ...) e1 e2 ...)
-	 #`(with-continuation-mark
-	       (parameterization-continuation-mark-key)
+	 #`(call-with-parameterization
 	       (parameterization-extend
 		(current-parameterization)
 		(list (parameter-key+value 'parameterize p v) ...))
-	     (letrec* ()
-	       e1 e2 ...))]
+             (lambda ()
+	       (letrec* ()
+	         e1 e2 ...)))]
 	[_
 	 (syntax-violation who "invalid syntax" stx)])))
 
